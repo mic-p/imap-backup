@@ -65,7 +65,7 @@ _CRASH_LOG_FILE = None
 try:
     crash_log_path = os.environ.get("PEC_IMAP_BACKUP_CRASH_LOG") or os.path.join(os.getcwd(), "pec_imap_backup_crash.log")
     _CRASH_LOG_FILE = open(crash_log_path, "a", encoding="utf-8", buffering=1)
-    _CRASH_LOG_FILE.write("\n--- avvio pec_imap_backup_pyside6 ---\n")
+    _CRASH_LOG_FILE.write("\n--- avvio imap_backup.py ---\n")
     _CRASH_LOG_FILE.write("argv=" + repr(sys.argv) + "\n")
     _CRASH_LOG_FILE.write("QT_QPA_PLATFORM=" + repr(os.environ.get("QT_QPA_PLATFORM")) + "\n")
     faulthandler.enable(file=_CRASH_LOG_FILE, all_threads=True)
@@ -113,6 +113,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -166,6 +167,40 @@ INDEX_HEADERS = [
     "size_bytes",
     "sha256",
     "error",
+]
+
+DEFAULT_XLSX_EXPORT_HEADERS = [
+    "saved_at",
+    "status",
+    "folder",
+    "uid",
+    "date_header",
+    "direction",
+    "mittente_vero",
+    "header_to",
+    "subject_header",
+    "filename",
+    "relative_path",
+    "size_bytes",
+    "sha256",
+    "error",
+]
+
+EXPORT_SHEET_NAME = "indice"
+INTERNAL_SHEET_NAME = "_internal"
+DEFAULT_FILENAME_TEMPLATE = "{date} - {party} - {subject} __{hash}"
+DEFAULT_FILENAME_MAX_LENGTH = 180
+FILENAME_TEMPLATE_FIELDS = [
+    ("date", "filename_date"),
+    ("party", "pec_party"),
+    ("subject", "subject_for_filename"),
+    ("folder", "folder"),
+    ("uid", "uid"),
+    ("direction", "direction"),
+    ("pec_type", "pec_type"),
+    ("message_id", "message_id"),
+    ("hash", "sha256_short"),
+    ("full_hash", "sha256"),
 ]
 
 WINDOWS_RESERVED_NAMES = {
@@ -590,7 +625,13 @@ def parse_header_preview(header_bytes: bytes, folder: str, uid: str, internal_da
 # ---------------------------------------------------------------------------
 
 
-def safe_component(value: str, max_len: int = 90, fallback: str = "senza_nome") -> str:
+def sanitize_filesystem_text(value: str, fallback: str = "senza_nome") -> str:
+    """Return text that is safe as one file-system path component.
+
+    The output avoids Windows/NTFS forbidden characters, ASCII control
+    characters, trailing dots/spaces and reserved DOS device names. The same
+    constraints are also safe on Linux and macOS.
+    """
     value = unicodedata.normalize("NFKC", value or "")
     value = value.replace("\x00", "")
     value = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", value)
@@ -600,17 +641,88 @@ def safe_component(value: str, max_len: int = 90, fallback: str = "senza_nome") 
         value = fallback
     if value.upper() in WINDOWS_RESERVED_NAMES:
         value = f"_{value}"
+    return value or fallback
+
+
+def safe_component(value: str, max_len: int = 90, fallback: str = "senza_nome") -> str:
+    value = sanitize_filesystem_text(value, fallback=fallback)
     if len(value) > max_len:
         value = value[:max_len].rstrip(" ._")
     return value or fallback
 
 
-def build_filename(meta: Dict[str, Any], sha256_hex: str) -> str:
-    date_part = safe_component(meta.get("filename_date") or "senza_data", 32)
-    party_part = safe_component(meta.get("pec_party") or meta.get("header_from") or "sconosciuto", 70)
-    subject_part = safe_component(meta.get("subject_for_filename") or meta.get("subject_header") or "senza_oggetto", 110)
-    short_hash = sha256_hex[:12]
-    return f"{date_part} - {party_part} - {subject_part} __{short_hash}.eml"
+def clamp_filename_max_length(value: Any) -> int:
+    try:
+        max_len = int(value)
+    except Exception:
+        max_len = DEFAULT_FILENAME_MAX_LENGTH
+    return min(max(max_len, 40), 240)
+
+
+def safe_eml_filename(base: str, sha256_hex: str, max_len: int) -> str:
+    """Build a filesystem-safe .eml filename whose total length is <= max_len."""
+    max_len = clamp_filename_max_length(max_len)
+    short_hash = (sha256_hex or "")[:12] or "nohash"
+    suffix = f" __{short_hash}"
+    clean = sanitize_filesystem_text(base, fallback="message")
+    if not clean.lower().endswith(short_hash.lower()):
+        clean = f"{clean}{suffix}"
+    ext = ".eml"
+    max_base_len = max_len - len(ext)
+    if len(clean) > max_base_len:
+        if clean.lower().endswith(short_hash.lower()):
+            # Preserve the short hash at the end, because it prevents collisions
+            # when long subjects are truncated.
+            allowed_prefix = max_base_len - len(suffix)
+            if allowed_prefix < 1:
+                clean = short_hash[:max_base_len]
+            else:
+                clean = clean[:allowed_prefix].rstrip(" ._") + suffix
+        else:
+            clean = clean[:max_base_len].rstrip(" ._")
+    clean = sanitize_filesystem_text(clean, fallback="message")
+    if len(clean) > max_base_len:
+        clean = clean[:max_base_len].rstrip(" ._")
+    return f"{clean or 'message'}{ext}"
+
+
+def filename_template_values(meta: Dict[str, Any], sha256_hex: str) -> Dict[str, str]:
+    return {
+        "date": str(meta.get("filename_date") or "senza_data"),
+        "party": str(meta.get("pec_party") or meta.get("mittente_vero") or meta.get("header_from") or "sconosciuto"),
+        "subject": str(meta.get("subject_for_filename") or meta.get("subject_header") or "senza_oggetto"),
+        "folder": str(meta.get("folder") or "cartella"),
+        "uid": str(meta.get("uid") or "uid"),
+        "direction": str(meta.get("direction") or ""),
+        "pec_type": str(meta.get("pec_type") or ""),
+        "message_id": str(meta.get("message_id") or ""),
+        "hash": (sha256_hex or "")[:12],
+        "full_hash": sha256_hex or "",
+    }
+
+
+def build_filename(
+    meta: Dict[str, Any],
+    sha256_hex: str,
+    template: str = DEFAULT_FILENAME_TEMPLATE,
+    max_len: int = DEFAULT_FILENAME_MAX_LENGTH,
+) -> str:
+    values = filename_template_values(meta, sha256_hex)
+    template = (template or DEFAULT_FILENAME_TEMPLATE).strip() or DEFAULT_FILENAME_TEMPLATE
+    try:
+        base = template.format(**values)
+    except Exception:
+        base = DEFAULT_FILENAME_TEMPLATE.format(**values)
+    return safe_eml_filename(base, sha256_hex, max_len)
+
+
+def with_filename_suffix(path: Path, suffix: str, max_len: int) -> Path:
+    max_len = clamp_filename_max_length(max_len)
+    ext = path.suffix or ".eml"
+    max_stem_len = max(max_len - len(ext) - len(suffix), 1)
+    stem = sanitize_filesystem_text(path.stem, fallback="message")
+    new_stem = stem[:max_stem_len].rstrip(" ._") + suffix
+    return path.with_name(f"{new_stem}{ext}")
 
 
 def atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -643,9 +755,21 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
 # ---------------------------------------------------------------------------
 
 
+def normalize_export_headers(headers: Optional[Sequence[str]]) -> List[str]:
+    selected: List[str] = []
+    for header in headers or DEFAULT_XLSX_EXPORT_HEADERS:
+        header = str(header).strip()
+        if header in INDEX_HEADERS and header not in selected:
+            selected.append(header)
+    if not selected:
+        selected = list(DEFAULT_XLSX_EXPORT_HEADERS)
+    return selected
+
+
 class IndexManager:
-    def __init__(self, index_path: Path):
+    def __init__(self, index_path: Path, export_headers: Optional[Sequence[str]] = None):
         self.index_path = index_path
+        self.export_headers = normalize_export_headers(export_headers)
         self.wb: Workbook
         self.ws: Worksheet
         self.header_to_col: Dict[str, int] = {}
@@ -655,13 +779,20 @@ class IndexManager:
     def _load(self) -> None:
         if self.index_path.exists():
             self.wb = load_workbook(self.index_path)
-            self.ws = self.wb.active
+            if INTERNAL_SHEET_NAME in self.wb.sheetnames:
+                self.ws = self.wb[INTERNAL_SHEET_NAME]
+            else:
+                self.ws = self.wb.active
+                # Existing indexes used a single visible sheet named "indice".
+                # Keep its data and move it to the hidden internal sheet so the
+                # visible sheet can be regenerated with the selected columns.
+                self.ws.title = INTERNAL_SHEET_NAME
             if self.ws.max_row < 1:
                 self.ws.append(INDEX_HEADERS)
         else:
             self.wb = Workbook()
             self.ws = self.wb.active
-            self.ws.title = "indice"
+            self.ws.title = INTERNAL_SHEET_NAME
             self.ws.append(INDEX_HEADERS)
         self._ensure_headers()
         self._backfill_derived_columns()
@@ -743,7 +874,31 @@ class IndexManager:
         self.ws.cell(row, self.header_to_col["status"], "deleted")
         self.ws.cell(row, self.header_to_col["deleted_at"], deleted_at)
 
-    def save(self) -> None:
+    def _refresh_export_sheet(self, export_headers: Optional[Sequence[str]] = None) -> None:
+        headers = normalize_export_headers(export_headers or self.export_headers)
+        if EXPORT_SHEET_NAME in self.wb.sheetnames and self.wb[EXPORT_SHEET_NAME] is not self.ws:
+            self.wb.remove(self.wb[EXPORT_SHEET_NAME])
+        if self.ws.title == EXPORT_SHEET_NAME:
+            self.ws.title = INTERNAL_SHEET_NAME
+        export_ws = self.wb.create_sheet(EXPORT_SHEET_NAME, 0)
+        export_ws.append(headers)
+        for r in range(2, self.ws.max_row + 1):
+            export_ws.append([self.ws.cell(r, self.header_to_col[h]).value for h in headers])
+        export_ws.freeze_panes = "A2"
+        if export_ws.max_row >= 1 and export_ws.max_column >= 1:
+            export_ws.auto_filter.ref = export_ws.dimensions
+        for c, header in enumerate(headers, start=1):
+            max_width = len(header)
+            for r in range(2, min(export_ws.max_row, 200) + 1):
+                value = export_ws.cell(r, c).value
+                if value is not None:
+                    max_width = max(max_width, min(len(str(value)), 60))
+            export_ws.column_dimensions[export_ws.cell(1, c).column_letter].width = min(max_width + 2, 64)
+        self.ws.sheet_state = "hidden"
+        self.wb.active = self.wb.index(export_ws)
+
+    def save(self, export_headers: Optional[Sequence[str]] = None) -> None:
+        self._refresh_export_sheet(export_headers)
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=self.index_path.name + ".", suffix=".xlsx", dir=str(self.index_path.parent))
         os.close(fd)
@@ -1104,6 +1259,9 @@ class RuntimeConfig:
     timeout_seconds: int = 60
     debug: bool = False
     preview_deep_pec: bool = True
+    xlsx_columns: Optional[List[str]] = None
+    filename_template: str = DEFAULT_FILENAME_TEMPLATE
+    filename_max_length: int = DEFAULT_FILENAME_MAX_LENGTH
 
 
 class WorkerBase(QObject):
@@ -1259,7 +1417,7 @@ class BackupWorker(WorkerBase):
     @Slot()
     def run(self) -> None:
         backup_dir = self.cfg.backup_dir
-        index = IndexManager(backup_dir / INDEX_FILENAME)
+        index = IndexManager(backup_dir / INDEX_FILENAME, self.cfg.xlsx_columns)
         candidates: List[Dict[str, str]] = []
         saved_count = 0
         skipped_count = 0
@@ -1301,7 +1459,7 @@ class BackupWorker(WorkerBase):
                             raw, internal, size_from_imap = imap.fetch_full_raw(uid)
                             sha = hashlib.sha256(raw).hexdigest()
                             meta = parse_full_metadata(raw, folder, uid, internal, self.cfg.username)
-                            filename = build_filename(meta, sha)
+                            filename = build_filename(meta, sha, self.cfg.filename_template, self.cfg.filename_max_length)
                             folder_safe = safe_component(folder.replace("/", "_"), 80, "cartella")
                             target_dir = backup_dir / folder_safe
                             target_path = target_dir / filename
@@ -1323,7 +1481,7 @@ class BackupWorker(WorkerBase):
                                     status = "already_saved"
                                 else:
                                     # Unlikely collision: change the suffix while keeping the hash.
-                                    target_path = target_path.with_name(target_path.stem + "_dup" + target_path.suffix)
+                                    target_path = with_filename_suffix(target_path, "_dup", self.cfg.filename_max_length)
                                     atomic_write_bytes(target_path, raw)
                                     if file_sha256(target_path) != sha:
                                         raise RuntimeError(tr("error_hash_verify_failed"))
@@ -1365,7 +1523,7 @@ class BackupWorker(WorkerBase):
                                 "error": "",
                             }
                             index.append_or_update(record)
-                            index.save()  # Save often: useful if the script is interrupted.
+                            index.save(self.cfg.xlsx_columns)  # Save often: useful if the script is interrupted.
                             candidates.append({"folder": folder, "uid": uid, "sha256": sha})
                             self.emit_log(tr("log_uid_saved", uid=uid, folder=folder, filename=target_path.name))
                         except Exception as msg_error:
@@ -1449,11 +1607,11 @@ class DeleteWorker(WorkerBase):
 
             self.check_cancelled()
             try:
-                index = IndexManager(Path(self.index_path))
+                index = IndexManager(Path(self.index_path), self.cfg.xlsx_columns)
                 deleted_at = datetime.now().isoformat(timespec="seconds")
                 for c in self.candidates:
                     index.mark_deleted(c["sha256"], deleted_at)
-                index.save()
+                index.save(self.cfg.xlsx_columns)
             except Exception as e:
                 failures.append(tr("error_index_update_after_delete_failed", error=e))
                 failed += 1
@@ -1524,6 +1682,130 @@ class MailSourceWorker(WorkerBase):
 # ---------------------------------------------------------------------------
 
 
+class AdvancedConfigDialog(QDialog):
+    def __init__(self, settings: QSettings, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle(tr("title_advanced_settings"))
+        self.resize(760, 680)
+
+        root = QVBoxLayout(self)
+
+        xlsx_box = QGroupBox(tr("group_xlsx_export"))
+        xlsx_layout = QVBoxLayout(xlsx_box)
+        xlsx_layout.addWidget(QLabel(tr("label_xlsx_columns")))
+        self.columns_list = QListWidget()
+        self.columns_list.setSelectionMode(QAbstractItemView.NoSelection)
+        current_columns = normalize_export_headers(self._settings_columns())
+        for header in INDEX_HEADERS:
+            item = QListWidgetItem(header)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Checked if header in current_columns else Qt.Unchecked)
+            self.columns_list.addItem(item)
+        xlsx_layout.addWidget(self.columns_list, 1)
+
+        col_buttons = QHBoxLayout()
+        select_all_btn = QPushButton(tr("button_select_all"))
+        select_all_btn.clicked.connect(self.select_all_columns)
+        default_cols_btn = QPushButton(tr("button_select_default"))
+        default_cols_btn.clicked.connect(self.select_default_columns)
+        col_buttons.addWidget(select_all_btn)
+        col_buttons.addWidget(default_cols_btn)
+        col_buttons.addStretch(1)
+        xlsx_layout.addLayout(col_buttons)
+        root.addWidget(xlsx_box, 2)
+
+        filename_box = QGroupBox(tr("group_filename"))
+        filename_form = QFormLayout(filename_box)
+        self.filename_template_edit = QLineEdit(str(self.settings.value("filename_template", DEFAULT_FILENAME_TEMPLATE)))
+        self.filename_max_spin = QSpinBox()
+        self.filename_max_spin.setRange(40, 240)
+        self.filename_max_spin.setValue(clamp_filename_max_length(self.settings.value("filename_max_length", DEFAULT_FILENAME_MAX_LENGTH)))
+        fields_text = ", ".join("{" + name + "}" for name, _source in FILENAME_TEMPLATE_FIELDS)
+        fields_label = QLabel(fields_text)
+        fields_label.setWordWrap(True)
+        filename_form.addRow(tr("label_filename_template"), self.filename_template_edit)
+        filename_form.addRow(tr("label_filename_max_length"), self.filename_max_spin)
+        filename_form.addRow(tr("label_available_filename_fields"), fields_label)
+        root.addWidget(filename_box)
+
+        log_box = QGroupBox(tr("group_log_file"))
+        log_form = QFormLayout(log_box)
+        self.save_log_check = QCheckBox(tr("check_save_log_file"))
+        self.save_log_check.setChecked(str(self.settings.value("save_log_file", "false")).lower() == "true")
+        self.log_dir_edit = QLineEdit(str(self.settings.value("log_dir", self.default_log_dir())))
+        self.log_dir_btn = QPushButton(tr("button_choose"))
+        self.log_dir_btn.clicked.connect(self.choose_log_dir)
+        log_dir_row = QHBoxLayout()
+        log_dir_row.addWidget(self.log_dir_edit, 1)
+        log_dir_row.addWidget(self.log_dir_btn)
+        log_form.addRow("", self.save_log_check)
+        log_form.addRow(tr("label_log_folder"), log_dir_row)
+        root.addWidget(log_box)
+
+        bottom = QHBoxLayout()
+        defaults_btn = QPushButton(tr("button_defaults"))
+        defaults_btn.clicked.connect(self.restore_defaults)
+        bottom.addWidget(defaults_btn)
+        bottom.addStretch(1)
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        bottom.addWidget(button_box)
+        root.addLayout(bottom)
+
+    def default_log_dir(self) -> str:
+        base = str(self.settings.value("backup_dir", str(Path.home() / "PEC_Backup"))).strip()
+        try:
+            return str(Path(base).expanduser() / "logs")
+        except Exception:
+            return str(Path.home() / "PEC_Backup" / "logs")
+
+    def _settings_columns(self) -> List[str]:
+        raw = str(self.settings.value("xlsx_columns", "")).strip()
+        if not raw:
+            return list(DEFAULT_XLSX_EXPORT_HEADERS)
+        return [x.strip() for x in raw.splitlines() if x.strip()]
+
+    def selected_columns(self) -> List[str]:
+        columns: List[str] = []
+        for i in range(self.columns_list.count()):
+            item = self.columns_list.item(i)
+            if item.checkState() == Qt.Checked:
+                columns.append(item.text())
+        return normalize_export_headers(columns)
+
+    def select_all_columns(self) -> None:
+        for i in range(self.columns_list.count()):
+            self.columns_list.item(i).setCheckState(Qt.Checked)
+
+    def select_default_columns(self) -> None:
+        defaults = set(DEFAULT_XLSX_EXPORT_HEADERS)
+        for i in range(self.columns_list.count()):
+            item = self.columns_list.item(i)
+            item.setCheckState(Qt.Checked if item.text() in defaults else Qt.Unchecked)
+
+    def restore_defaults(self) -> None:
+        self.select_default_columns()
+        self.filename_template_edit.setText(DEFAULT_FILENAME_TEMPLATE)
+        self.filename_max_spin.setValue(DEFAULT_FILENAME_MAX_LENGTH)
+        self.save_log_check.setChecked(False)
+        self.log_dir_edit.setText(self.default_log_dir())
+
+    def choose_log_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, tr("dialog_choose_log_folder"), self.log_dir_edit.text() or self.default_log_dir())
+        if d:
+            self.log_dir_edit.setText(d)
+
+    def save_to_settings(self) -> None:
+        self.settings.setValue("xlsx_columns", "\n".join(self.selected_columns()))
+        self.settings.setValue("filename_template", self.filename_template_edit.text().strip() or DEFAULT_FILENAME_TEMPLATE)
+        self.settings.setValue("filename_max_length", str(clamp_filename_max_length(self.filename_max_spin.value())))
+        self.settings.setValue("save_log_file", "true" if self.save_log_check.isChecked() else "false")
+        self.settings.setValue("log_dir", self.log_dir_edit.text().strip() or self.default_log_dir())
+        self.settings.sync()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1542,6 +1824,8 @@ class MainWindow(QMainWindow):
         self.pending_delete_candidates: List[Dict[str, str]] = []
         self.pending_index_path = ""
         self.preview_rows: List[Dict[str, Any]] = []
+        self._log_file_path: Optional[Path] = None
+        self._log_file_error_reported = False
         self._build_ui()
         self._load_settings()
 
@@ -1642,17 +1926,20 @@ class MainWindow(QMainWindow):
 
         btns = QHBoxLayout()
         self.save_settings_btn = QPushButton()
+        self.advanced_settings_btn = QPushButton()
         self.list_btn = QPushButton()
         self.preview_btn = QPushButton()
         self.backup_btn = QPushButton()
         self.stop_btn = QPushButton()
         self.stop_btn.setEnabled(False)
         self.save_settings_btn.clicked.connect(self._save_settings)
+        self.advanced_settings_btn.clicked.connect(self.open_advanced_settings)
         self.list_btn.clicked.connect(self.list_folders)
         self.preview_btn.clicked.connect(self.preview)
         self.backup_btn.clicked.connect(self.backup)
         self.stop_btn.clicked.connect(self.stop_current_worker)
         btns.addWidget(self.save_settings_btn)
+        btns.addWidget(self.advanced_settings_btn)
         btns.addWidget(self.list_btn)
         btns.addStretch(1)
         btns.addWidget(self.preview_btn)
@@ -1755,6 +2042,7 @@ class MainWindow(QMainWindow):
         self.delete_check.setText(tr("check_deleted_at_end"))
         self.expunge_check.setText(tr("check_expunge"))
         self.save_settings_btn.setText(tr("button_save_settings"))
+        self.advanced_settings_btn.setText(tr("button_advanced_settings"))
         self.list_btn.setText(tr("button_test_folders"))
         self.preview_btn.setText(tr("button_preview"))
         self.backup_btn.setText(tr("button_backup"))
@@ -1843,6 +2131,37 @@ class MainWindow(QMainWindow):
         except Exception:
             return ""
 
+    def xlsx_export_columns(self) -> List[str]:
+        raw = str(self.settings.value("xlsx_columns", "")).strip()
+        if not raw:
+            return list(DEFAULT_XLSX_EXPORT_HEADERS)
+        return normalize_export_headers([x.strip() for x in raw.splitlines() if x.strip()])
+
+    def filename_template(self) -> str:
+        return str(self.settings.value("filename_template", DEFAULT_FILENAME_TEMPLATE)).strip() or DEFAULT_FILENAME_TEMPLATE
+
+    def filename_max_length(self) -> int:
+        return clamp_filename_max_length(self.settings.value("filename_max_length", DEFAULT_FILENAME_MAX_LENGTH))
+
+    def save_log_file_enabled(self) -> bool:
+        return str(self.settings.value("save_log_file", "false")).lower() == "true"
+
+    def configured_log_dir(self) -> Path:
+        default = Path(self.dir_edit.text().strip() or str(Path.home() / "PEC_Backup")).expanduser() / "logs"
+        raw = str(self.settings.value("log_dir", str(default))).strip()
+        return Path(raw or str(default)).expanduser()
+
+    def open_advanced_settings(self) -> None:
+        dlg = AdvancedConfigDialog(self.settings, self)
+        if dlg.exec() == QDialog.Accepted:
+            old_log_dir = self.configured_log_dir()
+            old_log_enabled = self.save_log_file_enabled()
+            dlg.save_to_settings()
+            if old_log_dir != self.configured_log_dir() or old_log_enabled != self.save_log_file_enabled():
+                self._log_file_path = None
+                self._log_file_error_reported = False
+            self.log(tr("log_advanced_settings_saved"))
+
     def _settings_snapshot(self) -> Dict[str, str]:
         """Editable values to save and verify in QSettings.
 
@@ -1869,6 +2188,11 @@ class MainWindow(QMainWindow):
             "expunge": "true" if self.expunge_check.isChecked() else "false",
             "debug": "true" if self.debug_check.isChecked() else "false",
             "remember_password": "true" if self.save_pass_check.isChecked() else "false",
+            "xlsx_columns": "\n".join(self.xlsx_export_columns()),
+            "filename_template": self.filename_template(),
+            "filename_max_length": str(self.filename_max_length()),
+            "save_log_file": "true" if self.save_log_file_enabled() else "false",
+            "log_dir": str(self.configured_log_dir()),
         }
 
     def _restore_qt_state(self) -> None:
@@ -1989,14 +2313,41 @@ class MainWindow(QMainWindow):
         elif not silent:
             self.log(tr("log_settings_saved", count=len(values), cutoff=values["cutoff_date"]))
 
+    def _ensure_log_file_path(self) -> Optional[Path]:
+        if not self.save_log_file_enabled():
+            return None
+        log_dir = self.configured_log_dir()
+        if self._log_file_path is None or self._log_file_path.parent != log_dir:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._log_file_path = log_dir / f"imap_backup_{stamp}.log"
+            with self._log_file_path.open("a", encoding="utf-8") as f:
+                f.write(f"# {APP_NAME} log\n")
+                f.write(f"# script: {Path(__file__).name}\n")
+                f.write(f"# started_at: {datetime.now().isoformat(timespec='seconds')}\n\n")
+            self.log_edit.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] " + tr("log_file_created", path=str(self._log_file_path)))
+        return self._log_file_path
+
     def log(self, text: str) -> None:
-        self.log_edit.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
+        self.log_edit.appendPlainText(line)
+        if not self.save_log_file_enabled():
+            return
+        try:
+            path = self._ensure_log_file_path()
+            if path is not None:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception as e:
+            if not self._log_file_error_reported:
+                self._log_file_error_reported = True
+                self.log_edit.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] " + tr("log_file_write_failed", error=e))
 
     def clear_logs(self) -> None:
         self.log_edit.clear()
 
     def set_busy(self, busy: bool) -> None:
-        for w in [self.list_btn, self.preview_btn, self.backup_btn, self.save_settings_btn]:
+        for w in [self.list_btn, self.preview_btn, self.backup_btn, self.save_settings_btn, self.advanced_settings_btn]:
             w.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
 
@@ -2031,6 +2382,9 @@ class MainWindow(QMainWindow):
             timeout_seconds=self.timeout_spin.value(),
             debug=self.debug_check.isChecked(),
             preview_deep_pec=self.preview_deep_check.isChecked(),
+            xlsx_columns=self.xlsx_export_columns(),
+            filename_template=self.filename_template(),
+            filename_max_length=self.filename_max_length(),
         )
 
     def start_worker(self, worker: QObject, done_slot) -> None:
@@ -2365,21 +2719,21 @@ def _install_qt_debug_handler() -> None:
 def _print_debug_help() -> None:
     print(
         """Debug usage:
-  python pec_imap_backup_pyside6.py --safe-mode
+  python imap_backup.py --safe-mode
       Start without restoring the Qt layout and force software rendering.
 
-  python pec_imap_backup_pyside6.py --reset-settings
+  python imap_backup.py --reset-settings
       Clear saved settings and exit. Useful when crashes depend on corrupted
       QSettings/layout data.
 
-  python pec_imap_backup_pyside6.py --qt-debug-plugins
+  python imap_backup.py --qt-debug-plugins
       Write Qt/plugin diagnostic messages also to pec_imap_backup_crash.log.
 
-  python pec_imap_backup_pyside6.py --force-xcb
-  python pec_imap_backup_pyside6.py --force-wayland
+  python imap_backup.py --force-xcb
+  python imap_backup.py --force-wayland
       Force the Qt graphics backend on Linux.
 
-  PEC_IMAP_BACKUP_CRASH_LOG=/path/log.txt python pec_imap_backup_pyside6.py
+  PEC_IMAP_BACKUP_CRASH_LOG=/path/log.txt python imap_backup.py
       Change the crash log path.
 """
     )
